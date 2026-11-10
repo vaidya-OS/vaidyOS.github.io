@@ -6,7 +6,7 @@
 // ---------------------------------------------------------------- constants
 const CD = window.CDAAT_DATA; // CDAAT sections (from the handbook)
 const SECBY = Object.fromEntries(CD.map(s => [s.code, s]));
-const APPV = '1.0';
+const APPV = '1.1';
 const OCC = ['Desk job', 'Field / manual work', 'Student', 'Homemaker', 'Business', 'Farmer', 'Retired', 'Other'];
 const EDU = ['None', 'Primary', 'Secondary', 'Graduate', 'Postgraduate'];
 const SES = ['Upper', 'Upper-middle', 'Middle', 'Lower-middle', 'Lower'];
@@ -40,11 +40,11 @@ const num = v => (v === '' || v == null || isNaN(+v)) ? null : +v;
 
 // ---------------------------------------------------------------- storage (IndexedDB)
 const DB = {
-  db: null, patients: {}, visits: {}, meta: {},
+  db: null, patients: {}, visits: {}, meta: {}, audit: {}, certs: {},
   open() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open('cdaat-ehr', 1);
-      r.onupgradeneeded = () => { const d = r.result; ['patients', 'visits', 'meta'].forEach(s => d.objectStoreNames.contains(s) || d.createObjectStore(s, { keyPath: 'id' })); };
+      const r = indexedDB.open('cdaat-ehr', 2);
+      r.onupgradeneeded = () => { const d = r.result; ['patients', 'visits', 'meta', 'audit', 'certs'].forEach(s => d.objectStoreNames.contains(s) || d.createObjectStore(s, { keyPath: 'id' })); };
       r.onsuccess = () => { this.db = r.result; res(); };
       r.onerror = () => rej(r.error);
     });
@@ -52,7 +52,7 @@ const DB = {
   all(store) { return new Promise(res => { const out = {}; const q = this.db.transaction(store).objectStore(store).openCursor(); q.onsuccess = () => { const c = q.result; if (c) { out[c.value.id] = c.value; c.continue(); } else res(out); }; }); },
   put(store, obj) { obj.updatedAt = new Date().toISOString(); this[store][obj.id] = obj; return new Promise(res => { const tx = this.db.transaction(store, 'readwrite'); tx.objectStore(store).put(JSON.parse(JSON.stringify(obj))); tx.oncomplete = res; }); },
   del(store, id) { delete this[store][id]; return new Promise(res => { const tx = this.db.transaction(store, 'readwrite'); tx.objectStore(store).delete(id); tx.oncomplete = res; }); },
-  async load() { this.patients = await this.all('patients'); this.visits = await this.all('visits'); this.meta = await this.all('meta'); },
+  async load() { this.patients = await this.all('patients'); this.visits = await this.all('visits'); this.meta = await this.all('meta'); this.audit = await this.all('audit'); this.certs = await this.all('certs'); },
   setting(k, d) { return this.meta.settings?.[k] ?? d; },
   async saveSetting(k, v) { const s = this.meta.settings || { id: 'settings' }; s[k] = v; await this.put('meta', s); },
 };
@@ -63,8 +63,11 @@ let saveTimer = null;
 function autosave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
+    if (S.v && S.v.status === 'complete' && S.amendFor !== S.v.id) { S.amendFor = S.v.id; (S.v.amendments = S.v.amendments || []).push({ at: new Date().toISOString(), by: DB.setting('doctor', '') }); await logA('Visit amended', S.v.pid, 'Visit of ' + fmtD(S.v.date)); }
+    if (S.c && S.c.status === 'issued' && S.amendFor !== S.c.id) { S.amendFor = S.c.id; (S.c.amendments = S.c.amendments || []).push({ at: new Date().toISOString() }); await logA('Certificate edited after issue', S.c.pid, S.c.no); }
     if (S.p) await DB.put('patients', S.p);
     if (S.v) await DB.put('visits', S.v);
+    if (S.c) await DB.put('certs', S.c);
     const el = $('#savedAt'); if (el) el.textContent = 'Saved ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }, 350);
 }
@@ -92,7 +95,7 @@ function cdTags(v) {
 
 // ---------------------------------------------------------------- field renderers
 // ctx: 'p' = patient, 'v' = visit
-const obj = ctx => ctx === 'p' ? S.p : S.v;
+const obj = ctx => ctx === 'p' ? S.p : ctx === 'c' ? S.c : S.v;
 const val = (ctx, k) => getP(obj(ctx), k);
 const F = {
   text(ctx, k, label, o = {}) { return `<div class="f"><label>${label}${o.req ? ' <span class="req">*</span>' : ''}</label><input class="in" data-c="${ctx}" data-k="${k}" value="${esc(val(ctx, k))}" placeholder="${esc(o.ph || '')}" ${o.list ? `list="${o.list}"` : ''} ${o.type ? `type="${o.type}" inputmode="${o.type === 'tel' ? 'tel' : 'text'}"` : ''} autocomplete="off">${o.hint ? `<div class="hint">${o.hint}</div>` : ''}</div>`; },
@@ -162,7 +165,7 @@ function vToday() {
   const drafts = Object.values(DB.visits).filter(v => v.status === 'draft' && DB.patients[v.pid]?.name);
   const due = dueList();
   const last = DB.setting('lastBackup');
-  const old = !last || (Date.now() - new Date(last)) > 7 * 864e5;
+  const old = !last || (Date.now() - new Date(last)) > DB.setting('bkDays', 7) * 864e5;
   const pcount = Object.keys(DB.patients).length;
   const body = `
    <div class="stats"><div class="stat"><b>${todays.length}</b><span>Seen today</span></div><div class="stat"><b>${due.length}</b><span>Follow-ups due</span></div><div class="stat"><b>${pcount}</b><span>Patients</span></div></div>
@@ -237,13 +240,14 @@ function stepsFor(v) {
 }
 function vVisit(id, stepKey) {
   const v = DB.visits[id]; if (!v) return go('#/today');
-  S.v = v; S.p = DB.patients[v.pid];
+  if (S.v?.id !== id) S.amendFor = null;
+  S.v = v; S.p = DB.patients[v.pid]; S.c = null;
   const st = stepsFor(v);
   let i = Math.max(0, st.findIndex(s => s[0] === stepKey)); if (!stepKey) i = 0;
   S.step = i;
   const [key, name] = st[i];
   const steps = `<div class="steps">${st.map((s, j) => `<a class="stp ${j === i ? 'on' : j < i ? 'done' : ''}" href="#/visit/${v.id}/${s[0]}">${j + 1}. ${s[1]}</a>`).join('')}</div>`;
-  const body = STEP[key]();
+  const body = (v.status === 'complete' ? `<div class="warn" style="margin:12px 16px 0">This visit was saved on ${fmtDT(v.completedAt)}. Any change will be recorded as an amendment.</div>` : '') + STEP[key]();
   const prev = i > 0 ? `#/visit/${v.id}/${st[i - 1][0]}` : null;
   const next = i < st.length - 1 ? `#/visit/${v.id}/${st[i + 1][0]}` : null;
   const bar = `<div class="bar"><div class="in">${prev ? `<a class="btn sec" href="${prev}" style="flex:0 0 30%">‹ Back</a>` : ''}${next ? `<a class="btn pri" href="${next}">Next · ${st[i + 1][1]} ›</a>` : `<button class="btn gold" data-act="finish">✓ Save visit</button>`}</div></div>`;
@@ -263,7 +267,15 @@ const STEP = {
      ${F.sel('p', 'occupation', 'Occupation', OCC)}${F.text('p', 'occDetail', 'Occupation details', { ph: 'Optional' })}
      <div class="grid2">${F.sel('p', 'education', 'Education', EDU)}${F.sel('p', 'ses', 'Socio-economic status', SES)}</div>
      ${F.date('p', 'firstDate', 'Date of first visit')}
-     ${F.ticks('p', '', [['consent', 'Patient consents to treatment and to keeping a digital record']])}
+     <div class="st">Identity</div><div class="sth">NCISM 2023 asks for at least one identity proof with the record.</div>
+     <div class="grid2">${F.sel('p', 'idType', 'ID proof', ['Aadhaar', 'Voter ID', 'PAN', 'Driving licence', 'Passport', 'Other'])}${F.text('p', 'idNo', 'Last 4 digits', { ph: 'e.g. 1234' })}</div>
+     ${F.text('p', 'abha', 'ABHA number / address (optional)', { ph: '14-digit ABHA or name@abdm' })}
+     ${isMinor(S.p) ? F.text('p', 'guardian', 'Guardian name & relation (patient is under 18)', { req: 1 }) : F.text('p', 'guardian', 'Guardian / attendant (if any)')}
+     <div class="st">Consent</div>
+     <div class="calc" style="font-size:13px">Data notice: the patient’s details are recorded only for treatment, follow-up and legally required record-keeping (at least 3 years), kept confidential on this device, and shared only as required by law or with consent. The patient may ask for a copy, correction or deletion.</div>
+     ${F.ticks('p', '', [['consent', 'Patient consents to treatment and to keeping a digital record'], ['consentForm', 'Signed consent form (signature / thumb impression) kept in file'], ['consentResearch', 'Agrees to de-identified academic / research use']])}
+     ${F.date('p', 'consentDate', 'Consent date')}
+     <button class="btn sec" style="width:100%" data-act="consentform">🖨 Print consent form (English + ગુજરાતી)</button>
      <div id="dupWarn"></div></div>`;
   },
   cc() {
@@ -380,8 +392,10 @@ const STEP = {
      ${S.v.rx.map((r, i) => `<div class="rep"><button class="x" data-act="delrow" data-k="rx" data-i="${i}">✕</button>
        ${F.text('v', `rx.${i}.med`, `Medicine ${i + 1}`, { list: 'meds' })}
        <div class="grid2">${F.sel('v', `rx.${i}.form`, 'Form', FORMS)}${F.text('v', `rx.${i}.dose`, 'Dose', { ph: 'e.g. 3 g / 2 tab' })}</div>
-       <div class="grid2">${F.sel('v', `rx.${i}.freq`, 'Times / day', ['Once', 'Twice', 'Thrice', 'Four times', 'As needed'])}${F.text('v', `rx.${i}.dur`, 'Duration', { ph: 'e.g. 15 days' })}</div>
-       ${F.sel('v', `rx.${i}.kala`, 'Aushadha sevana kala', KALA)}${F.sel('v', `rx.${i}.anu`, 'Anupana', ANUPANA)}</div>`).join('')}
+       ${F.chips('v', `rx.${i}.slots`, 'When in the day', SLOTS, true)}${r.freq && !(r.slots || []).length ? `<div class="hint">Earlier entry: ${esc(r.freq)}</div>` : ''}
+       ${F.text('v', `rx.${i}.dur`, 'Duration', { ph: 'e.g. 15 days' })}
+       ${F.sel('v', `rx.${i}.kala`, 'Aushadha sevana kala', KALA)}${F.sel('v', `rx.${i}.anu`, 'Anupana', ANUPANA)}
+       <details><summary class="hint" style="cursor:pointer">＋ Ingredients / use-before (for medicines bought from market)</summary>${F.text('v', `rx.${i}.ingr`, 'Ingredients / base formula')}${F.date('v', `rx.${i}.exp`, 'Use before')}</details></div>`).join('')}
      <button class="add" data-act="addrow" data-k="rx">＋ Add medicine</button>
      <div class="st">Panchakarma</div>
      ${S.v.pk.map((r, i) => `<div class="rep"><button class="x" data-act="delrow" data-k="pk" data-i="${i}">✕</button>
@@ -501,46 +515,50 @@ function reviewView() {
    ${miss.length ? `<div class="warn">Please fill: <b>${miss.join(', ')}</b> (Registration)</div>` : ''}
    ${dupOPD ? `<div class="warn">OPD No. ${esc(p.opd)} is already used by another patient.</div>` : ''}
    <table class="sc" style="margin-top:8px"><tbody>${rows.map(([a, b]) => `<tr><td style="width:32%;color:var(--mute)">${a}</td><td>${b}</td></tr>`).join('')}
-   ${rx.length ? `<tr><td style="color:var(--mute)">Prescription</td><td>${rx.map(r => `<b>${esc(r.med)}</b> ${esc(r.dose || '')} ${esc((r.freq || '').toLowerCase())} · ${esc(r.kala || '')} · ${esc(r.anu || '')} · ${esc(r.dur || '')}`).join('<br>')}</td></tr>` : ''}
+   ${rx.length ? `<tr><td style="color:var(--mute)">Prescription</td><td>${rx.map(r => `<b>${esc(r.med)}</b> ${esc(r.dose || '')} ${esc(slotTxt(r).toLowerCase())} · ${esc(r.kala || '')} · ${esc(r.anu || '')} · ${esc(r.dur || '')}`).join('<br>')}</td></tr>` : ''}
    ${pk.length ? `<tr><td style="color:var(--mute)">Panchakarma</td><td>${pk.map(r => `${esc(r.proc)}${r.days ? ` × ${r.days} days` : ''}${r.resp ? ` – ${esc(r.resp)}` : ''}`).join('<br>')}</td></tr>` : ''}
    ${v.next ? `<tr><td style="color:var(--mute)">Next visit</td><td><b>${fmtD(v.next)}</b></td></tr>` : ''}</tbody></table>
    <div class="inl" style="margin-top:16px"><button class="btn sec" data-act="print" data-v="rx">🖨 Prescription</button><button class="btn sec" data-act="print" data-v="sum">🖨 Visit summary</button></div>
-   <div class="inl" style="margin-top:10px"><button class="btn sec" data-act="share">↗ Share (WhatsApp)</button></div></div>`;
+   <div class="inl" style="margin-top:10px"><button class="btn sec" data-act="pcard" data-v="${v.id}">🖨 Patient card</button><button class="btn sec" data-act="share">↗ Share (WhatsApp)</button></div></div>`;
 }
 async function finish() {
   const p = S.p, v = S.v;
   if (!p.name || !p.opd) { toast('Please fill Name and OPD No.'); return go(`#/visit/${v.id}/${v.type === 'first' ? 'reg' : 'rev'}`); }
-  v.status = 'complete'; v.completedAt = new Date().toISOString();
+  if (isMinor(p) && !p.guardian) { toast('Patient is under 18 – add guardian name (Registration)'); return go(`#/visit/${v.id}/${v.type === 'first' ? 'reg' : 'rev'}`); }
+  const wasDone = v.status === 'complete';
+  if (!wasDone) { v.status = 'complete'; v.completedAt = new Date().toISOString(); v.by = DB.setting('doctor', ''); }
   await DB.put('patients', p); await DB.put('visits', v);
+  if (!wasDone) await logA(v.type === 'first' ? 'Patient registered · first visit saved' : 'Follow-up visit saved', p.id, fmtD(v.date));
   toast('Visit saved'); go(`#/p/${p.id}`);
 }
 
 // ---------------------------------------------------------------- print & share
 function letterhead() {
-  const n = DB.setting('clinic', 'Ayurveda Clinic'), d = DB.setting('doctor', ''), a = DB.setting('clinicAddr', ''), ph = DB.setting('clinicPhone', '');
-  return `<div class="clinic"><div style="text-align:left"><h1>${esc(n)}</h1>${d ? `<p>${esc(d)}</p>` : ''}</div><div>${esc(a)}${ph ? '<br>' + esc(ph) : ''}</div></div>`;
+  const n = DB.setting('clinic', 'Ayurveda Clinic'), d = DB.setting('doctor', ''), q = DB.setting('qual', ''), r = DB.setting('regNo', ''), cn = DB.setting('council', ''), a = DB.setting('clinicAddr', ''), ph = DB.setting('clinicPhone', '');
+  return `<div class="clinic"><div style="text-align:left"><h1>${esc(n)}</h1>${d ? `<p><b>${esc(d)}</b>${q ? ', ' + esc(q) : ''}</p>` : ''}${r ? `<p>Reg. No. ${esc(r)}${cn ? ' · ' + esc(cn) : ''}</p>` : ''}</div><div>${esc(a)}${ph ? '<br>' + esc(ph) : ''}</div></div>`;
 }
-function doPrint(kind, v = S.v) {
+async function doPrint(kind, v = S.v) {
   const p = DB.patients[v.pid]; const { rows, rx, pk } = visitSummaryHTML(v, p);
   const pinfo = `<table><tr><td><b>${esc(p.name)}</b> · ${esc(p.age || '')} ${esc((p.sex || '')[0] || '')}</td><td>OPD ${esc(p.opd)}</td><td>${fmtD(v.date)}</td></tr></table>`;
   const pa = v.pa || {}; const li = s => (s || '').split('\n').filter(x => x.trim()).map(x => `<li>${esc(x)}</li>`).join('');
   let h = `<div class="pr">${letterhead()}${pinfo}`;
   if (kind === 'sum') h += `<h2>Visit summary</h2><table>${rows.map(([a, b]) => `<tr><th style="width:26%">${a}</th><td>${b}</td></tr>`).join('')}</table>`;
   else { if (v.dx?.ayur) h += `<p style="margin-top:8px"><b>Diagnosis:</b> ${esc(v.dx.ayur)}</p>`; }
-  if (rx.length) h += `<h2>Rx</h2><table><tr><th>#</th><th>Medicine</th><th>Dose</th><th>Times</th><th>Kala</th><th>Anupana</th><th>Duration</th></tr>${rx.map((r, i) => `<tr><td>${i + 1}</td><td><b>${esc(r.med)}</b>${r.form ? `<br><small>${esc(r.form)}</small>` : ''}</td><td>${esc(r.dose || '')}</td><td>${esc(r.freq || '')}</td><td>${esc(r.kala || '')}</td><td>${esc(r.anu || '')}</td><td>${esc(r.dur || '')}</td></tr>`).join('')}</table>`;
+  if (rx.length) h += `<h2>Rx</h2><table><tr><th>#</th><th>Medicine</th><th>Dose</th><th>Times</th><th>Kala</th><th>Anupana</th><th>Duration</th></tr>${rx.map((r, i) => `<tr><td>${i + 1}</td><td><b>${esc(r.med)}</b>${r.form ? `<br><small>${esc(r.form)}</small>` : ''}${r.ingr ? `<br><small>Contains: ${esc(r.ingr)}</small>` : ''}${r.exp ? `<br><small>Use before ${fmtD(r.exp)}</small>` : ''}</td><td>${esc(r.dose || '')}</td><td>${esc(slotTxt(r))}</td><td>${esc(r.kala || '')}</td><td>${esc(r.anu || '')}</td><td>${esc(r.dur || '')}</td></tr>`).join('')}</table>`;
   if (pk.length) h += `<h2>Panchakarma</h2><table>${pk.map(r => `<tr><td>${esc(r.proc)}</td><td>${r.date ? fmtD(r.date) : ''}${r.days ? ` · ${r.days} days` : ''}</td><td>${esc(r.det || '')}</td></tr>`).join('')}</table>`;
   if (pa.pathya || pa.apathya) h += `<h2>Pathya – Apathya</h2><table><tr><th style="width:50%">Pathya (advised)</th><th>Apathya (avoid)</th></tr><tr><td><ul style="margin-left:16px">${li(pa.pathya)}</ul></td><td><ul style="margin-left:16px">${li(pa.apathya)}</ul></td></tr></table>`;
   if (v.invNote) h += `<h2>Advised investigations</h2><p>${esc(v.invNote)}</p>`;
   if (v.next) h += `<p style="margin-top:10px"><b>Next visit:</b> ${fmtD(v.next)}</p>`;
-  h += `<div class="foot"><span>Generated with VAIDYA.OS</span><span>Signature ____________________</span></div></div>`;
-  $('#print').innerHTML = h;
+  h += await verLine(v);
+  h += `<div class="foot"><span>Generated with VAIDYA.OS</span>${sigBlock()}</div></div>`;
+  $('#print').innerHTML = h; regWarn();
   setTimeout(() => window.print(), 100);
 }
 function shareText(v = S.v) {
   const p = DB.patients[v.pid]; const rx = (v.rx || []).filter(r => r.med);
   let s = `${DB.setting('clinic', 'Ayurveda Clinic')}\n${p.name} · OPD ${p.opd} · ${fmtD(v.date)}\n`;
   if (v.dx?.ayur) s += `Diagnosis: ${v.dx.ayur}\n`;
-  if (rx.length) s += '\nMedicines:\n' + rx.map((r, i) => `${i + 1}. ${r.med} – ${r.dose || ''} ${r.freq || ''}, ${r.kala || ''}${r.anu ? ', with ' + r.anu : ''}${r.dur ? ', ' + r.dur : ''}`).join('\n') + '\n';
+  if (rx.length) s += '\nMedicines:\n' + rx.map((r, i) => `${i + 1}. ${r.med} – ${r.dose || ''} ${slotTxt(r)}, ${r.kala || ''}${r.anu ? ', with ' + r.anu : ''}${r.dur ? ', ' + r.dur : ''}`).join('\n') + '\n';
   if (v.pa?.pathya) s += '\nPathya: ' + v.pa.pathya.split('\n').filter(Boolean).join(', ') + '\n';
   if (v.pa?.apathya) s += 'Avoid: ' + v.pa.apathya.split('\n').filter(Boolean).join(', ') + '\n';
   if (v.next) s += `\nNext visit: ${fmtD(v.next)}`;
@@ -556,11 +574,11 @@ async function doShare(v = S.v) {
 // ---------------------------------------------------------------- patient profile
 function vProfile(pid, tab) {
   const p = DB.patients[pid]; if (!p) return go('#/patients');
-  S.p = p; S.v = null; S.ptab = tab || S.ptab || 'overview';
+  S.p = p; S.v = null; S.c = null; S.ptab = tab || S.ptab || 'overview';
   const vs = visitsOf(pid).filter(v => v.status === 'complete');
   const lv = vs.at(-1);
   const a = p.allergy || {}; const al = [a.drug, a.food, a.other].filter(Boolean).join(', ');
-  const tabs = [['overview', 'Overview'], ['visits', `Visits (${vs.length})`], ['trends', 'Trends'], ['inv', 'Investigations'], ['tx', 'Treatment'], ['info', 'Details']];
+  const tabs = [['overview', 'Overview'], ['visits', `Visits (${vs.length})`], ['trends', 'Trends'], ['inv', 'Investigations'], ['tx', 'Treatment'], ['certs', 'Certificates'], ['info', 'Details']];
   let body = `${al ? `<div class="allergy">⚠ Allergy: ${esc(al)}</div>` : ''}<div class="ptabs">${tabs.map(([k, l]) => `<a class="${S.ptab === k ? 'on' : ''}" href="#/p/${pid}/${k}">${l}</a>`).join('')}</div>`;
   body += PTAB[S.ptab](p, vs, lv);
   const bar = `<div class="bar"><div class="in">${p.phone ? `<a class="btn sec" href="tel:${esc(p.phone)}" style="flex:0 0 28%">☎ Call</a>` : ''}<button class="btn pri" data-act="follow" data-v="${pid}">＋ New visit</button></div></div>`;
@@ -581,7 +599,11 @@ const PTAB = {
       <dt>Medicines</dt><dd>${rx.map(r => esc(r.med)).join(', ') || '—'}</dd>
       <dt>Next visit</dt><dd>${lv.next ? fmtD(lv.next) : '—'}</dd>
       <dt>Past history</dt><dd>${pastText(p) || '—'}</dd></dl></div></div>
-     <div class="pad inl"><button class="btn sec" data-act="printv" data-v="${lv.id}" data-k="rx">🖨 Prescription</button><button class="btn sec" data-act="sharev" data-v="${lv.id}">↗ Share</button></div>`;
+     <div class="pad inl"><button class="btn sec" data-act="printv" data-v="${lv.id}" data-k="rx">🖨 Prescription</button><button class="btn sec" data-act="pcard" data-v="${lv.id}">🖨 Patient card</button></div>
+     <div class="h">Patient file</div>
+     <div class="pad" style="padding-top:0"><button class="btn pri" style="width:100%" data-act="casefile" data-v="${p.id}">⬇ Complete case file (PDF)</button>
+     <div class="hint">History, every visit, CDAAT, treatment and outcome. Use it to give the patient a copy of their records (NCISM: within 7 days of request), or de-identified for case presentations.</div>
+     <div class="inl" style="margin-top:10px"><button class="btn sec" data-act="sharev" data-v="${lv.id}">↗ Share Rx</button><button class="btn sec" data-act="pexport" data-v="${p.id}">⬇ Data file</button></div></div>`;
   },
   visits(p, vs) {
     const drafts = visitsOf(p.id).filter(v => v.status === 'draft');
@@ -614,18 +636,27 @@ const PTAB = {
   tx(p, vs) {
     const items = vs.slice().reverse().filter(v => (v.rx || []).some(r => r.med) || (v.pk || []).some(r => r.proc));
     if (!items.length) return '<div class="empty">No treatment recorded.</div>';
-    return items.map(v => `<div class="h">${fmtD(v.date)}</div><div class="card"><div class="ci" style="font-size:14px">${(v.rx || []).filter(r => r.med).map(r => `<b>${esc(r.med)}</b> – ${esc(r.dose || '')} ${esc(r.freq || '')} · ${esc(r.kala || '')} · ${esc(r.anu || '')} · ${esc(r.dur || '')}`).join('<br>')}${(v.pk || []).filter(r => r.proc).map(r => `<br>🜂 ${esc(r.proc)}${r.days ? ` × ${r.days} d` : ''}${r.resp ? ` – ${esc(r.resp)}` : ''}`).join('')}</div></div>`).join('');
+    return items.map(v => `<div class="h">${fmtD(v.date)}</div><div class="card"><div class="ci" style="font-size:14px">${(v.rx || []).filter(r => r.med).map(r => `<b>${esc(r.med)}</b> – ${esc(r.dose || '')} ${esc(slotTxt(r))} · ${esc(r.kala || '')} · ${esc(r.anu || '')} · ${esc(r.dur || '')}`).join('<br>')}${(v.pk || []).filter(r => r.proc).map(r => `<br>🜂 ${esc(r.proc)}${r.days ? ` × ${r.days} d` : ''}${r.resp ? ` – ${esc(r.resp)}` : ''}`).join('')}</div></div>`).join('');
+  },
+  certs(p) {
+    const cs = Object.values(DB.certs).filter(c => c.pid === p.id).sort((a, b) => b.date.localeCompare(a.date));
+    return `<div class="pad"><button class="btn pri" style="width:100%" data-act="newcert" data-v="${p.id}">＋ Issue certificate</button></div>
+     ${cs.length ? cs.map(c => `<a class="vcard" href="#/cert/${c.id}"><div class="dt"><b>${dd(c.date)}</b><small>${mon(c.date)}</small></div><div class="d"><b>${esc(c.no)}</b>${esc(c.type)}${c.dx ? ' · ' + esc(c.dx) : ''}</div><span class="tag ${c.status === 'issued' ? 'nir' : 'draft'}">${c.status === 'issued' ? 'ISSUED' : 'DRAFT'}</span></a>`).join('') : '<div class="empty">No certificates issued.</div>'}`;
   },
   info(p) {
     const lv = visitsOf(p.id).find(v => v.type === 'first');
+    const log = auditOf(p.id).slice(0, 30);
     return `<div class="card"><div class="ci"><dl class="kv">
      <dt>OPD No.</dt><dd>${esc(p.opd)}</dd><dt>Age / Sex</dt><dd>${esc(p.age || '')} ${esc(p.sex || '')}</dd><dt>Phone</dt><dd>${esc(p.phone || '—')}</dd>
      <dt>Address</dt><dd>${esc(p.address || '—')}</dd><dt>Occupation</dt><dd>${esc([p.occupation, p.occDetail].filter(Boolean).join(' – ') || '—')}</dd>
      <dt>Education</dt><dd>${esc(p.education || '—')}</dd><dt>SES</dt><dd>${esc(p.ses || '—')}</dd><dt>First visit</dt><dd>${fmtD(p.firstDate)}</dd>
-     <dt>Consent</dt><dd>${p.consent ? 'Yes' : 'Not recorded'}</dd><dt>Past history</dt><dd>${pastText(p) || '—'}</dd>
+     <dt>ID proof</dt><dd>${esc(maskId(p) || '—')}</dd><dt>ABHA</dt><dd>${esc(p.abha || '—')}</dd><dt>Guardian</dt><dd>${esc(p.guardian || '—')}</dd>
+     <dt>Consent</dt><dd>${p.consent ? 'Yes' + (p.consentDate ? ' · ' + fmtD(p.consentDate) : '') : '<b style="color:var(--red)">Not recorded</b>'}${p.consentForm ? '<br>Signed form on file' : ''}${p.consentResearch ? '<br>De-identified academic use: yes' : ''}</dd><dt>Past history</dt><dd>${pastText(p) || '—'}</dd>
      <dt>Family history</dt><dd>${esc([p.family?.same && 'Same complaint', p.family?.dm && 'Diabetes', p.family?.htn && 'Hypertension', p.family?.other].filter(Boolean).join(', ') || '—')}${p.family?.rel?.length ? ' (' + p.family.rel.join(', ') + ')' : ''}</dd></dl></div></div>
      <div class="pad">${lv ? `<a class="btn sec" href="#/visit/${lv.id}/reg" style="width:100%">✎ Edit registration & history</a>` : ''}
-     <button class="btn danger" style="width:100%;margin-top:10px" data-act="delpatient" data-v="${p.id}">Delete patient</button></div>`;
+     <button class="btn sec" style="width:100%;margin-top:10px" data-act="consentformp" data-v="${p.id}">🖨 Consent form</button>
+     <button class="btn danger" style="width:100%;margin-top:10px" data-act="delpatient" data-v="${p.id}">Delete patient</button></div>
+     <div class="h">Record history <small>audit trail</small></div>${log.length ? `<div class="pad" style="padding-top:0"><table class="sc"><tbody>${log.map(a => `<tr><td style="width:38%;color:var(--mute);font-size:12.5px">${fmtDT(a.at)}</td><td>${esc(a.action)}${a.detail ? `<br><small style="color:var(--mute)">${esc(a.detail)}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No entries yet.</div>'}`;
   },
 };
 function pastText(p) { const x = p.past || {}; return esc([x.dm && 'Diabetes', x.htn && 'Hypertension', x.thy && 'Thyroid', x.asthma && 'Asthma', x.cardiac && 'Cardiac', x.kidney && 'Kidney', x.other].filter(Boolean).join(', ')); }
@@ -650,13 +681,188 @@ function vVisitDetail(id) {
   const meals = MEALS.filter(([k]) => ph.meals?.[k]?.f || ph.meals?.[k]?.t).map(([k, l]) => `${l}: ${esc(ph.meals[k].t || '')} ${esc(ph.meals[k].f || '')} ${ph.meals[k].q ? '(' + ph.meals[k].q + ')' : ''}`);
   const body = `<div class="pad"><table class="sc"><tbody>${rows.map(([a, b]) => `<tr><td style="width:32%;color:var(--mute)">${a}</td><td>${b}</td></tr>`).join('')}
     ${meals.length ? `<tr><td style="color:var(--mute)">Ahara</td><td>${meals.join('<br>')}</td></tr>` : ''}
-    ${rx.length ? `<tr><td style="color:var(--mute)">Prescription</td><td>${rx.map(r => `<b>${esc(r.med)}</b> ${esc(r.dose || '')} · ${esc(r.kala || '')} · ${esc(r.anu || '')} · ${esc(r.dur || '')}`).join('<br>')}</td></tr>` : ''}
+    ${rx.length ? `<tr><td style="color:var(--mute)">Prescription</td><td>${rx.map(r => `<b>${esc(r.med)}</b> ${esc(r.dose || '')} ${esc(slotTxt(r))} · ${esc(r.kala || '')} · ${esc(r.anu || '')} · ${esc(r.dur || '')}`).join('<br>')}</td></tr>` : ''}
     ${pk.length ? `<tr><td style="color:var(--mute)">Panchakarma</td><td>${pk.map(r => esc(r.proc) + (r.resp ? ' – ' + esc(r.resp) : '')).join('<br>')}</td></tr>` : ''}
     ${v.next ? `<tr><td style="color:var(--mute)">Next visit</td><td>${fmtD(v.next)}</td></tr>` : ''}</tbody></table>
     <div class="inl" style="margin-top:14px"><button class="btn sec" data-act="printv" data-v="${v.id}" data-k="rx">🖨 Prescription</button><button class="btn sec" data-act="printv" data-v="${v.id}" data-k="sum">🖨 Summary</button></div>
-    <div class="inl" style="margin-top:10px"><button class="btn sec" data-act="sharev" data-v="${v.id}">↗ Share</button><a class="btn sec" href="#/visit/${v.id}">✎ Edit visit</a></div>
+    <div class="inl" style="margin-top:10px"><button class="btn sec" data-act="pcard" data-v="${v.id}">🖨 Patient card</button><button class="btn sec" data-act="sharev" data-v="${v.id}">↗ Share</button></div>
+    <div class="calc" style="margin-top:12px;font-size:13px">Recorded ${fmtDT(v.completedAt)}${v.by ? ' by ' + esc(v.by) : ''}${(v.amendments || []).length ? `<br>Amended: ${v.amendments.map(a => fmtDT(a.at)).join(', ')}` : ''}<br>Verification code: <b id="vcode">…</b><br><span class="hint">Printed on every PDF of this visit; it changes if the record is edited.</span></div>
+    <a class="btn sec" href="#/visit/${v.id}" style="width:100%;margin-top:10px">✎ Amend visit</a>
     <button class="btn danger" style="width:100%;margin-top:10px" data-act="delvisit" data-v="${v.id}">Delete visit</button></div>`;
   render(shell({ title: `${S.p.name} · ${fmtD(v.date)}`, sub: v.type === 'first' ? 'First visit' : 'Follow-up', back: `#/p/${S.p.id}/visits`, body, nav: false }));
+  verCode(v).then(c => { const el = $('#vcode'); if (el) el.textContent = c; });
+}
+
+// ---------------------------------------------------------------- v1.1: audit, verification, documents
+async function logA(action, pid, detail = '') {
+  const a = { id: uid(), at: new Date().toISOString(), action, pid: pid || '', detail, by: DB.setting('doctor', '') };
+  await DB.put('audit', a);
+}
+const auditOf = pid => Object.values(DB.audit).filter(a => !pid || a.pid === pid).sort((a, b) => b.at.localeCompare(a.at));
+const fmtDT = iso => { if (!iso) return ''; const d = new Date(iso); return `${fmtD(iso.slice(0, 10))} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`; };
+async function verCode(v) {
+  const copy = JSON.parse(JSON.stringify(v)); delete copy.updatedAt; delete copy.amendments;
+  const stable = o => Array.isArray(o) ? '[' + o.map(stable).join(',') + ']' : (o && typeof o === 'object') ? '{' + Object.keys(o).sort().map(k => JSON.stringify(k) + ':' + stable(o[k])).join(',') + '}' : JSON.stringify(o);
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(stable(copy) + stable(DB.patients[v.pid] ? { n: DB.patients[v.pid].name, o: DB.patients[v.pid].opd } : {})));
+  return [...new Uint8Array(b)].slice(0, 6).map(x => x.toString(16).padStart(2, '0')).join('').toUpperCase().replace(/(.{4})/g, '$1-').slice(0, 14);
+}
+const maskId = p => p.idType ? `${p.idType}${p.idNo ? ' ••••' + String(p.idNo).slice(-4) : ''}` : '';
+const isMinor = p => num(p.age) != null && num(p.age) < 18;
+const SLOTS = ['Morning', 'Afternoon', 'Evening', 'Night'];
+const SLOT_GU = { Morning: 'સવાર', Afternoon: 'બપોર', Evening: 'સાંજ', Night: 'રાત' };
+const FREQ_SLOTS = { Once: ['Morning'], Twice: ['Morning', 'Night'], Thrice: ['Morning', 'Afternoon', 'Night'], 'Four times': SLOTS };
+const slotsOf = r => (r.slots && r.slots.length) ? r.slots : (FREQ_SLOTS[r.freq] || []);
+const slotTxt = r => slotsOf(r).length ? slotsOf(r).join(', ') : (r.freq || '');
+const KALA_GU = { 'Abhakta (empty stomach)': 'ખાલી પેટે', 'Pragbhakta (before food)': 'જમ્યા પહેલાં', 'Madhyabhakta (middle of meal)': 'જમતી વખતે વચ્ચે', 'Adhobhakta (after food)': 'જમ્યા પછી', 'Sabhakta (with food)': 'ભોજન સાથે', 'Antarabhakta (between meals)': 'બે ભોજન વચ્ચે', 'Samudga (before & after food)': 'જમ્યા પહેલાં અને પછી', 'Muhurmuhu (repeatedly)': 'વારંવાર', 'Sagrasa (with morsel)': 'પહેલા કોળિયા સાથે', 'Grasantara (between morsels)': 'કોળિયા વચ્ચે', 'Nishi (bedtime)': 'સૂતી વખતે' };
+const ANU_GU = { 'Warm water': 'ગરમ પાણી', Milk: 'દૂધ', Honey: 'મધ', Ghee: 'ઘી', Takra: 'છાશ', 'Plain water': 'પાણી' };
+const plainKala = k => k ? k.replace(/^[^(]*\(([^)]*)\).*$/, '$1') : '';
+function regWarn() { if (!DB.setting('regNo')) toast('Tip: add your registration number in Settings – it must appear on prescriptions'); }
+function sigBlock() {
+  const d = DB.setting('doctor', ''), q = DB.setting('qual', ''), r = DB.setting('regNo', '');
+  return `<div style="text-align:right">____________________<br>${esc(d)}${q ? ', ' + esc(q) : ''}${r ? `<br>Reg. No. ${esc(r)}` : ''}</div>`;
+}
+async function verLine(v) {
+  const code = await verCode(v);
+  const am = (v.amendments || []).length ? ` · Amended ${fmtDT(v.amendments.at(-1).at)}` : '';
+  return `<p style="font-size:8pt;color:#666;margin-top:10px">Recorded ${fmtDT(v.completedAt || v.updatedAt)}${am} · Record ${esc(v.id)} · Verification code <b>${code}</b> (VAIDYA.OS)</p>`;
+}
+
+// ---------- consent form (bilingual)
+function consentForm(p) {
+  const d = DB.setting('doctor', '…………………………');
+  const h = `<div class="pr">${letterhead()}
+   <h1 style="font-size:15pt;margin:6px 0">Consent for Treatment and Record-keeping <span class="gu" style="font-size:12pt;color:#333">· સારવાર અને રેકોર્ડ માટે સંમતિ પત્ર</span></h1>
+   <table><tr><td>Name / નામ: <b>${esc(p.name || '')}</b></td><td>Age / ઉંમર: ${esc(p.age || '')}</td><td>Sex: ${esc(p.sex || '')}</td><td>OPD No.: ${esc(p.opd || '')}</td></tr>
+   <tr><td colspan="2">Address / સરનામું: ${esc(p.address || '')}</td><td colspan="2">ID proof: ${esc(maskId(p))}${p.abha ? ` · ABHA ${esc(p.abha)}` : ''}</td></tr></table>
+   <h2>1. Consent for treatment · સારવાર માટે સંમતિ</h2>
+   <p>I consent to examination and Ayurvedic treatment, including Panchakarma procedures if advised, by ${esc(d)}. The nature of my illness, the proposed treatment, its expected benefits and possible side effects have been explained to me in a language I understand. I may ask questions or stop treatment at any time.</p>
+   <p class="gu">હું ${esc(d)} દ્વારા તપાસ અને આયુર્વેદિક સારવાર (જરૂર હોય તો પંચકર્મ સહિત) માટે સંમતિ આપું છું. મારી બીમારી, સૂચવેલી સારવાર, તેના અપેક્ષિત લાભ અને શક્ય આડઅસરો મને સમજાય તેવી ભાષામાં સમજાવવામાં આવી છે. હું ગમે ત્યારે પ્રશ્ન પૂછી શકું છું અથવા સારવાર બંધ કરી શકું છું.</p>
+   <h2>2. Consent for digital record · ડિજિટલ રેકોર્ડ માટે સંમતિ</h2>
+   <p>My personal and health information will be recorded digitally by this clinic only for my treatment, follow-up and keeping medical records as required by law (at least 3 years). It will be kept confidential on the clinic’s device and will not be shared with anyone except as required by law or with my permission. I may ask for a copy of my records, for correction, or for deletion after the legal retention period.</p>
+   <p class="gu">મારી વ્યક્તિગત અને આરોગ્ય માહિતી આ ક્લિનિક દ્વારા ફક્ત મારી સારવાર, ફોલો-અપ અને કાયદા મુજબ તબીબી રેકોર્ડ રાખવા (ઓછામાં ઓછા 3 વર્ષ) માટે ડિજિટલ રીતે નોંધવામાં આવશે. તે ક્લિનિકના ઉપકરણમાં ગોપનીય રાખવામાં આવશે અને કાયદા મુજબ જરૂરી હોય તે સિવાય અથવા મારી પરવાનગી વિના કોઈને આપવામાં આવશે નહીં. હું મારા રેકોર્ડની નકલ, સુધારો અથવા કાયદાકીય સમયગાળા પછી કાઢી નાખવાની માંગ કરી શકું છું.</p>
+   <h2>3. Optional · વૈકલ્પિક</h2>
+   <p>☐ I agree that my record, with my identity removed, may be used for academic or research purposes.<br><span class="gu">☐ મારી ઓળખ છુપાવીને મારો રેકોર્ડ શૈક્ષણિક અથવા સંશોધન હેતુ માટે ઉપયોગ થઈ શકે તે માટે હું સંમત છું.</span></p>
+   <table style="margin-top:14px"><tr><th style="width:50%">Patient signature / thumb impression<br><span class="gu">દર્દીની સહી / અંગૂઠાનું નિશાન</span></th><th>Guardian (if patient is a minor or unable to consent)<br><span class="gu">વાલી (સગીર હોય અથવા સંમતિ આપી ન શકે તો)</span></th></tr>
+   <tr><td style="height:70px"></td><td style="height:70px;vertical-align:bottom"><small>Name & relation: ${esc(p.guardian || '')}</small></td></tr>
+   <tr><th>Witness name & signature / સાક્ષી</th><th>Doctor</th></tr><tr><td style="height:60px"></td><td style="vertical-align:bottom">${sigBlock()}</td></tr></table>
+   <p style="margin-top:10px">Date / તારીખ: ____________  Place / સ્થળ: ____________</p></div>`;
+  $('#print').innerHTML = h; regWarn(); setTimeout(() => window.print(), 150);
+}
+
+// ---------- patient follow-up card (bilingual, for the patient's file)
+async function patientCard(v) {
+  const p = DB.patients[v.pid]; const rx = (v.rx || []).filter(r => r.med);
+  const past = visitsOf(p.id).filter(x => x.status === 'complete' && x.id !== v.id && x.date <= v.date).slice(-6);
+  const li = s => (s || '').split('\n').filter(x => x.trim()).map(x => `<li>${esc(x)}</li>`).join('');
+  const ph = DB.setting('clinicPhone', '');
+  const h = `<div class="pr">${letterhead()}
+   <h1 style="font-size:16pt;margin:4px 0 6px">Patient Follow-up Card <span class="gu" style="font-size:13pt;color:#333">· દર્દી ફોલો-અપ કાર્ડ</span></h1>
+   <table><tr><td style="width:45%">Name / નામ: <b style="font-size:12pt">${esc(p.name)}</b></td><td>OPD No.: <b style="font-size:12pt">${esc(p.opd)}</b></td><td>Date / તારીખ: <b>${fmtD(v.date)}</b></td></tr>
+   ${v.dx?.ayur ? `<tr><td colspan="3">Diagnosis / નિદાન: <b>${esc(v.dx.ayur)}</b></td></tr>` : ''}</table>
+   ${rx.length ? `<h2>Medicines · દવાઓ</h2><table style="font-size:11pt"><tr><th>Medicine / દવા</th><th>Dose / માત્રા</th>${SLOTS.map(s => `<th style="text-align:center">${s}<br><span class="gu">${SLOT_GU[s]}</span></th>`).join('')}<th>When / ક્યારે</th><th>With / સાથે</th><th>Duration</th></tr>
+     ${rx.map(r => `<tr><td><b>${esc(r.med)}</b>${r.form ? `<br><small>${esc(r.form)}</small>` : ''}</td><td>${esc(r.dose || '')}</td>${SLOTS.map(s => `<td style="text-align:center;font-size:14pt">${slotsOf(r).includes(s) ? '✓' : ''}</td>`).join('')}<td>${esc(plainKala(r.kala))}${KALA_GU[r.kala] ? `<br><span class="gu">${KALA_GU[r.kala]}</span>` : ''}</td><td>${esc(r.anu || '')}${ANU_GU[r.anu] ? `<br><span class="gu">${ANU_GU[r.anu]}</span>` : ''}</td><td>${esc(r.dur || '')}</td></tr>`).join('')}</table>` : ''}
+   ${v.pa?.pathya || v.pa?.apathya ? `<table style="margin-top:8px"><tr><th style="width:50%">Do / Eat · શું કરવું-ખાવું</th><th>Avoid · શું ન કરવું-ન ખાવું</th></tr><tr><td><ul style="margin-left:16px">${li(v.pa.pathya)}</ul></td><td><ul style="margin-left:16px">${li(v.pa.apathya)}</ul></td></tr></table>` : ''}
+   ${(v.pk || []).filter(r => r.proc).length ? `<p style="margin-top:6px"><b>Procedure / પંચકર્મ:</b> ${(v.pk || []).filter(r => r.proc).map(r => esc(r.proc) + (r.days ? ` – ${r.days} days` : '')).join(', ')}</p>` : ''}
+   ${v.next ? `<div style="margin:12px 0;border:2px solid #0E2730;border-radius:6px;padding:8px 12px;font-size:13pt"><b>Next visit · આગામી મુલાકાત: ${fmtD(v.next)}</b></div>` : ''}
+   <h2>Visit record · મુલાકાતની નોંધ</h2><table><tr><th style="width:22%">Date / તારીખ</th><th>Notes / નોંધ</th><th style="width:22%">Sign / સહી</th></tr>
+   ${past.map(x => `<tr><td>${fmtD(x.date)}</td><td>${esc((x.cc || []).filter(c => c.text).map(c => c.text).join(', ').slice(0, 90))}</td><td></td></tr>`).join('')}
+   <tr><td>${fmtD(v.date)}</td><td>${esc((v.cc || []).filter(c => c.text).map(c => c.text).join(', ').slice(0, 90))}</td><td></td></tr>
+   ${'<tr><td style="height:30px"></td><td></td><td></td></tr>'.repeat(5)}</table>
+   <p style="margin-top:12px;font-size:11pt"><b>Please bring this card at every visit.</b> <span class="gu">દરેક મુલાકાત વખતે આ કાર્ડ સાથે લાવવું.</span>${ph ? `<br>For any problem contact / કોઈ તકલીફ હોય તો સંપર્ક કરો: <b>${esc(ph)}</b>` : ''}</p>
+   <div class="foot"><span>${sigBlock()}</span></div></div>`;
+  $('#print').innerHTML = h; regWarn(); setTimeout(() => window.print(), 150);
+}
+
+// ---------- complete case file
+async function caseFile(pid, named) {
+  const p = DB.patients[pid]; const vs = visitsOf(pid).filter(v => v.status === 'complete');
+  if (!vs.length) return toast('No completed visits yet');
+  const first = vs[0], last = vs.at(-1);
+  const nm = named ? esc(p.name) : esc(initials(p.name).split('').join('. ') + '.');
+  const T = rows => { const rr = rows.filter(r => r && r[1] !== '' && r[1] != null); return rr.length ? `<table>${rr.map(([a, b]) => `<tr><th style="width:28%">${a}</th><td>${b}</td></tr>`).join('')}</table>` : '<p style="color:#777">Not recorded</p>'; };
+  const yes = (o, list) => list.filter(([k]) => o?.[k]).map(x => x[1]).join(', ');
+  const ph = first.ph || {};
+  const mealTxt = MEALS.filter(([k]) => ph.meals?.[k]?.f || ph.meals?.[k]?.t).map(([k, l]) => `${l}: ${esc(ph.meals[k].t || '')} ${esc(ph.meals[k].f || '')}${ph.meals[k].q ? ' (' + ph.meals[k].q + ')' : ''}`).join('<br>');
+  const avg = v => { const s = (v.cc || []).map(x => num(x.sev)).filter(x => x != null); return s.length ? +(s.reduce((a, b) => a + b) / s.length).toFixed(1) : null; };
+  const sf = cdScores(first), sl = cdScores(last);
+  const cmp = (l, a, b, lowerBetter = true) => { const d = a != null && b != null ? +(b - a).toFixed(1) : null; const tag = d == null || d === 0 ? '' : ((d < 0) === lowerBetter ? ' <b style="color:#2E6B3F">improved</b>' : ' <b style="color:#B4442E">worse</b>'); return `<tr><td>${l}</td><td>${a ?? '–'}</td><td>${b ?? '–'}</td><td>${d == null ? '' : (d > 0 ? '+' : '') + d}${tag}</td></tr>`; };
+  const lab = vs.map(v => `${dd(v.date)} ${mon(v.date)}`);
+  const codes = await Promise.all(vs.map(verCode));
+  const m = first.mens || {};
+  let h = `<div class="pr">${letterhead()}
+   <h1 style="font-size:15pt;margin:4px 0 2px">Patient Case File</h1><p style="color:#555">Prepared ${fmtD(today())} · ${vs.length} visit${vs.length > 1 ? 's' : ''} · ${fmtD(first.date)} to ${fmtD(last.date)}${named ? '' : ' · identity withheld'}</p>
+   <h2>Patient</h2>${T([['Patient', `${nm}${p.age ? ' · ' + esc(p.age) + ' yrs' : ''}${p.sex ? ' · ' + esc(p.sex) : ''}`], ['OPD No.', named ? esc(p.opd) : '—'], ...(named ? [['Phone', esc(p.phone || '')], ['Address', esc(p.address || '')], ['ID proof', esc(maskId(p))], ['ABHA', esc(p.abha || '')]] : []), ['Guardian', named ? esc(p.guardian || '') : ''], ['Occupation', esc([p.occupation, p.occDetail].filter(Boolean).join(' – '))], ['Education · SES', esc([p.education, p.ses].filter(Boolean).join(' · '))], ['Consent', [p.consent && 'Treatment & digital record' + (p.consentDate ? ' (' + fmtD(p.consentDate) + ')' : ''), p.consentForm && 'signed form on file', p.consentResearch && 'de-identified academic use'].filter(Boolean).join(' · ') || 'Not recorded']])}
+   <h2>Presenting complaints · first visit ${fmtD(first.date)}</h2>${T((first.cc || []).filter(c => c.text).map((c, i) => [`${i + 1}`, `${esc(c.text)}${c.dur ? ` – ${esc(c.dur)} ${esc((c.unit || '').toLowerCase())}` : ''}${c.sev != null && c.sev !== '' ? ` · severity ${c.sev}/10` : ''}`]))}
+   <h2>History</h2>${T([['Past history', pastText(p)], ['Surgery / hospital stay', esc(p.past?.surgery || '')], ['Current medicines', esc(p.past?.meds || '')], ['Allergy', esc(p.allergy?.none ? 'No known allergy' : [p.allergy?.drug, p.allergy?.food, p.allergy?.other].filter(Boolean).join(', '))], ['Family history', esc([p.family?.same && 'Same complaint', p.family?.dm && 'Diabetes', p.family?.htn && 'Hypertension', p.family?.other].filter(Boolean).join(', ')) + (p.family?.rel?.length ? ' (' + p.family.rel.join(', ') + ')' : '')]])}
+   <h2>Personal history</h2>${T([['Ahara', mealTxt], ['Diet · water', esc([ph.diet, ph.water && ph.water + ' L/day', ph.viruddha && 'Viruddha: ' + ph.viruddha].filter(Boolean).join(' · '))], ['Sleep', esc([ph.wake && 'Wake ' + ph.wake, ph.sleep && 'Sleep ' + ph.sleep, ph.ds?.freq && `Divaswapna ${ph.ds.freq}/wk ${ph.ds.dur || ''} ${ph.ds.time || ''}`, ph.rj && `Ratrijagarana ${ph.rj}/wk`].filter(Boolean).join(' · '))], ['Vyayama', esc([ph.ex?.type?.join(', '), ph.ex?.freq && ph.ex.freq + ' days/wk', ph.ex?.dur && ph.ex.dur + ' min'].filter(Boolean).join(' · '))], ['Screen time', esc([ph.scr?.hrs && ph.scr.hrs + ' h/day', ph.scr?.dev?.join(', '), ph.scr?.pat, ph.scr?.bed && 'in bed before sleep'].filter(Boolean).join(' · '))], ['Agni · Koshtha', esc([ph.agni, ph.koshtha].filter(Boolean).join(' · '))], ['Mala · Mutra', esc([ph.mala?.freq && ph.mala.freq + '/day', ph.mala?.type?.join(', '), (ph.mutra?.day || ph.mutra?.night) && `Mutra ${ph.mutra.day || '–'} day / ${ph.mutra.night || '–'} night`].filter(Boolean).join(' · '))], ['Vegadharana · Vyasana', esc([ph.vega && 'Vegadharana', ph.tea && ph.tea + ' cups tea/coffee', ph.tob && 'Tobacco', ph.alc && 'Alcohol', ph.vyOther].filter(Boolean).join(', '))]])}
+   ${p.sex === 'Female' && Object.values(m).some(x => x !== '' && x != null && (!Array.isArray(x) || x.length)) ? `<h2>Menstrual & obstetric</h2>${T([['Menstrual', esc([m.lmp && 'LMP ' + fmtD(m.lmp), m.cycle && m.cycle + '-day cycle', m.days && m.days + ' days', m.flow, m.sym?.join(', ')].filter(Boolean).join(' · '))], ['Obstetric', ['G', 'P', 'L', 'A'].map(x => m[x] !== undefined && m[x] !== '' ? x + m[x] : '').join(' ')]])}` : ''}
+   <h2>Examination · first visit</h2>${T([['General', yes(first.ex, [['pallor', 'Pallor'], ['icterus', 'Icterus'], ['oedema', 'Oedema'], ['lymph', 'Lymph nodes'], ['cyanosis', 'Cyanosis'], ['clubbing', 'Clubbing']]) || 'NAD'], ['Jihva', esc(first.ex?.jihva || '')], ...SYSTEMS.filter(([k]) => first.ex?.sys?.[k]).map(([k, l]) => [l, esc(first.ex?.note?.[k] || 'Examined')])])}
+   <h2>Diagnosis</h2>${T([['Ayurveda', esc(last.dx?.ayur || first.dx?.ayur || '') + (last.dx?.code ? ` [${esc(last.dx.code)}]` : '')], ['Modern', esc(last.dx?.modern || first.dx?.modern || '')]])}
+   <h2>Visit-wise record</h2><table><tr><th>Date</th><th>Complaints (severity)</th><th>CDAAT</th><th>Vitals</th><th>Treatment</th></tr>
+   ${vs.map((v, i) => { const sc = cdScores(v); const c = v.cdaat?.concl || {}; const vit = v.vit || {}; return `<tr><td>${fmtD(v.date)}<br><small>${i === 0 ? 'First' : 'Follow-up ' + i}<br>Code ${codes[i]}${(v.amendments || []).length ? '<br>Amended' : ''}</small></td><td>${(v.cc || []).filter(x => x.text).map(x => `${esc(x.text)} ${x.sev ?? '–'}/10`).join('<br>')}${v.fu?.notes ? `<br><small>${esc(v.fu.notes)}</small>` : ''}${v.fu?.adv ? `<br><small style="color:#B4442E">Adverse: ${esc(v.fu.advText || 'yes')}</small>` : ''}</td><td>${DOSHA.map(([k, n]) => c[k] ? `${n} ${c[k]}` : '').filter(Boolean).join(', ')}${v.cdaat?.ama ? `<br>${v.cdaat.ama}` : ''}<br><small>V${sc.V[0]} P${sc.P[0]} K${sc.K[0]} · Sama ${sc.G[0]}</small></td><td><small>${[vit.pulse && 'P ' + vit.pulse, vit.sys && 'BP ' + vit.sys + '/' + (vit.dia || ''), vit.wt && 'Wt ' + vit.wt].filter(Boolean).join('<br>')}</small></td><td><small>${(v.rx || []).filter(r => r.med).map(r => esc(r.med) + (r.dose ? ' ' + esc(r.dose) : '')).join('<br>')}${(v.pk || []).filter(r => r.proc).map(r => '<br>' + esc(r.proc) + (r.days ? ' ×' + r.days + 'd' : '')).join('')}</small></td></tr>`; }).join('')}</table>
+   ${vs.length > 1 ? `<h2>Outcome · first vs latest visit</h2><table><tr><th>Measure</th><th>${fmtD(first.date)}</th><th>${fmtD(last.date)}</th><th>Change</th></tr>
+     ${cmp('Average complaint severity (0–10)', avg(first), avg(last))}
+     ${(first.cc || []).filter(c => c.text).map(c => { const l = (last.cc || []).find(x => x.text === c.text); return l ? cmp(esc(c.text), num(c.sev), num(l.sev)) : ''; }).join('')}
+     ${DOSHA.map(([k, n], j) => cmp(n + ' vriddhi score', sf[['V', 'P', 'K'][j]][0], sl[['V', 'P', 'K'][j]][0])).join('')}
+     ${cmp('Sama score (general)', sf.G[0], sl.G[0])}${cmp('Nirama score (general)', sf.NG[0], sl.NG[0], false)}
+     ${cmp('Weight (kg)', num(first.vit?.wt), num(last.vit?.wt))}${cmp('BP systolic', num(first.vit?.sys), num(last.vit?.sys))}
+     <tr><td>Ama state</td><td>${first.cdaat?.ama || '–'}</td><td>${last.cdaat?.ama || '–'}</td><td></td></tr></table>
+     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px">${chart('Complaint severity', lab, [['Severity', '#B4442E', vs.map(avg)]], 10)}${chart('CDAAT vriddhi', lab, DOSHA.map(([k, n, , col], j) => [n, col, vs.map(v => cdScores(v)[['V', 'P', 'K'][j]][0])]))}</div>` : ''}
+   ${(() => { const inv = vs.flatMap(v => (v.inv || []).filter(x => x.test).map(x => ({ ...x, vd: v.date }))); return inv.length ? `<h2>Investigations</h2><table><tr><th>Test</th><th>Date</th><th>Value</th></tr>${inv.sort((a, b) => a.test.localeCompare(b.test) || (a.date || a.vd).localeCompare(b.date || b.vd)).map(x => `<tr><td>${esc(x.test)}</td><td>${fmtD(x.date || x.vd)}</td><td>${esc(x.val || '')}</td></tr>`).join('')}</table>` : ''; })()}
+   <h2>Current treatment · ${fmtD(last.date)}</h2>${(last.rx || []).filter(r => r.med).length ? `<table><tr><th>Medicine</th><th>Dose</th><th>Times</th><th>Kala</th><th>Anupana</th><th>Duration</th></tr>${last.rx.filter(r => r.med).map(r => `<tr><td>${esc(r.med)}${r.form ? ` (${esc(r.form)})` : ''}${r.ingr ? `<br><small>${esc(r.ingr)}</small>` : ''}</td><td>${esc(r.dose || '')}</td><td>${esc(slotTxt(r))}</td><td>${esc(r.kala || '')}</td><td>${esc(r.anu || '')}</td><td>${esc(r.dur || '')}</td></tr>`).join('')}</table>` : '<p>—</p>'}
+   ${last.pa?.pathya || last.pa?.apathya ? `<table style="margin-top:6px"><tr><th style="width:50%">Pathya</th><th>Apathya</th></tr><tr><td>${esc(last.pa.pathya || '').replace(/\n/g, '<br>')}</td><td>${esc(last.pa.apathya || '').replace(/\n/g, '<br>')}</td></tr></table>` : ''}
+   <p style="margin-top:12px;font-size:8.5pt;color:#555">CDAAT scores count the classical signs ticked at each visit (Clinical Dosha & Ama Assessment Tool); dosha conclusions are the treating physician’s. Each visit’s verification code changes if that record is edited. ${named ? '' : 'Patient identity withheld; shared with consent for academic use only.'}</p>
+   <div class="foot"><span>Generated with VAIDYA.OS · ${fmtD(today())}</span>${sigBlock()}</div></div>`;
+  $('#print').innerHTML = h; regWarn();
+  await logA(named ? 'Case file printed' : 'Case file printed (de-identified)', pid);
+  setTimeout(() => window.print(), 150);
+}
+async function exportPatient(pid) {
+  const p = DB.patients[pid]; const vs = visitsOf(pid);
+  const data = JSON.stringify({ app: 'cdaat-ehr', v: APPV, at: new Date().toISOString(), patients: [p], visits: vs, certs: Object.values(DB.certs).filter(c => c.pid === pid) });
+  const file = new File([data], `VAIDYA-OS-patient-${String(p.opd || p.id).replace(/[^\w-]/g, '_')}-${today()}.json`, { type: 'application/json' });
+  await logA('Patient data file exported', pid);
+  if (navigator.canShare?.({ files: [file] })) { try { await navigator.share({ files: [file], title: file.name }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+  dl(file); toast('Patient file saved');
+}
+
+// ---------- certificates
+const CERT_TYPES = ['Medical certificate (illness / leave)', 'Fitness certificate', 'Treatment certificate', 'Other'];
+function nextCertNo() { const pre = 'CERT/' + today().slice(0, 4) + '/'; const n = Object.values(DB.certs).map(c => c.no || '').filter(x => x.startsWith(pre)).map(x => parseInt(x.slice(pre.length)) || 0); return pre + String(Math.max(0, ...n) + 1).padStart(4, '0'); }
+async function newCert(pid) {
+  const lv = lastDone(pid);
+  const c = { id: uid(), pid, no: nextCertNo(), date: today(), type: CERT_TYPES[0], dx: lv?.dx?.ayur || '', from: '', to: '', fitFrom: '', remarks: '', idMark: '', createdAt: new Date().toISOString(), status: 'draft' };
+  await DB.put('certs', c); go(`#/cert/${c.id}`);
+}
+function vCert(id) {
+  const c = DB.certs[id]; if (!c) return go('#/patients');
+  const p = DB.patients[c.pid]; S.c = c; S.p = p; S.v = null;
+  const fit = c.type === 'Fitness certificate';
+  const body = `<div class="sec" style="padding-bottom:90px"><div class="st">${esc(c.no)}</div><div class="sth">${c.status === 'issued' ? 'Issued ' + fmtDT(c.issuedAt) + ' – edits after issue are logged.' : 'Draft'}</div>
+   ${F.chips('c', 'type', 'Type', CERT_TYPES)}
+   ${F.date('c', 'date', 'Date of issue')}
+   ${F.text('c', 'dx', 'Diagnosis / condition')}
+   <div class="grid2">${F.date('c', 'from', 'Under treatment from')}${F.date('c', 'to', 'To')}</div>
+   ${fit ? F.date('c', 'fitFrom', 'Fit to resume duties from') : ''}
+   ${F.area('c', 'remarks', 'Remarks / advice', 'e.g. advised rest for 5 days')}
+   ${F.text('c', 'idMark', 'Patient identification mark', { hint: 'Required for the certificate register (NCISM 22(17)(ख)), e.g. mole on left cheek' })}</div>`;
+  const bar = `<div class="bar"><div class="in"><button class="btn sec" data-act="certprint" data-v="${c.id}">🖨 Print</button><button class="btn gold" data-act="certissue" data-v="${c.id}">${c.status === 'issued' ? '✓ Issued' : '✓ Issue & save'}</button></div></div>`;
+  render(shell({ title: `Certificate · ${p.name}`, sub: `OPD ${esc(p.opd)}`, back: `#/p/${p.id}/certs`, body, bar, nav: false }));
+}
+function certText(c, p) {
+  const who = `${p.sex === 'Female' ? 'Ms.' : p.sex === 'Male' ? 'Mr.' : ''} ${esc(p.name)}, aged ${esc(p.age || '…')} years, OPD No. ${esc(p.opd)}`;
+  if (c.type === 'Fitness certificate') return `This is to certify that ${who}, was under my treatment${c.dx ? ` for <b>${esc(c.dx)}</b>` : ''}${c.from ? ` from ${fmtD(c.from)}` : ''}${c.to ? ` to ${fmtD(c.to)}` : ''}, and is now fit to resume normal duties${c.fitFrom ? ` from <b>${fmtD(c.fitFrom)}</b>` : ''}.`;
+  if (c.type === 'Treatment certificate') return `This is to certify that ${who}, is under my Ayurvedic treatment${c.dx ? ` for <b>${esc(c.dx)}</b>` : ''}${c.from ? ` since ${fmtD(c.from)}` : ''}.`;
+  return `This is to certify that ${who}, was examined by me and is suffering from <b>${esc(c.dx || '…')}</b>${c.from ? `. He/she was under my treatment from ${fmtD(c.from)}` : ''}${c.to ? ` to ${fmtD(c.to)}` : ''}.`;
+}
+async function printCert(id) {
+  const c = DB.certs[id], p = DB.patients[c.pid];
+  $('#print').innerHTML = `<div class="pr">${letterhead()}<p style="text-align:right">No. <b>${esc(c.no)}</b><br>Date: ${fmtD(c.date)}</p>
+   <h1 style="text-align:center;font-size:15pt;margin:14px 0;text-decoration:underline">${esc(c.type === 'Other' ? 'Certificate' : c.type.replace(/ \(.*/, ''))}</h1>
+   <p style="font-size:12pt;line-height:1.8">${certText(c, p)}</p>${c.remarks ? `<p style="font-size:12pt;line-height:1.8">${esc(c.remarks)}</p>` : ''}
+   <table style="margin-top:20px"><tr><th style="width:50%">Signature / thumb impression of patient</th><th>Identification mark</th></tr><tr><td style="height:60px"></td><td>${esc(c.idMark || '')}</td></tr></table>
+   <div style="margin-top:30px">${sigBlock()}</div><p style="font-size:8pt;color:#666;margin-top:16px">Recorded in the certificate register of ${esc(DB.setting('clinic', ''))} · ${esc(c.no)} · VAIDYA.OS</p></div>`;
+  regWarn(); setTimeout(() => window.print(), 150);
 }
 
 // ---------------------------------------------------------------- insights
@@ -685,7 +891,11 @@ function vSettings() {
   const tpl = DB.setting('paTemplates', {});
   const body = `<div class="sec">
    <div class="st">Clinic (for printouts)</div>
-   ${sfield('clinic', 'Clinic name', 'Ayurveda Clinic')}${sfield('doctor', 'Doctor name & qualification', 'Dr. …, BAMS')}${sfield('clinicAddr', 'Address')}${sfield('clinicPhone', 'Phone')}
+   ${sfield('clinic', 'Clinic name', 'Ayurveda Clinic')}${sfield('doctor', 'Doctor name', 'Dr. …')}
+   <div class="grid2">${sfield('qual', 'Qualification', 'BAMS, MD (Ayu)')}${sfield('regNo', 'Registration No.', 'Required on prescriptions')}</div>
+   ${sfield('council', 'Registered with (Board / State council)', 'e.g. Gujarat Board of Ayurvedic & Unani Systems of Medicine')}
+   ${sfield('clinicAddr', 'Address')}${sfield('clinicPhone', 'Phone')}
+   ${DB.setting('regNo') ? '' : '<div class="warn">NCISM 2023 requires your registration number on every prescription, certificate and receipt.</div>'}
    ${sfield('opdPrefix', 'OPD number prefix', today().slice(0, 4) + '/', 'Next number is added automatically, e.g. 2026/0001')}
    <div class="st">Security</div>
    <div class="calc">App lock is <b>${pinOn ? 'ON' : 'OFF'}</b>. ${pinOn ? 'The app asks for your PIN when opened and after 5 minutes away.' : 'Set a PIN to protect patient data.'}</div>
@@ -693,7 +903,12 @@ function vSettings() {
    <div class="st">Backup & restore</div>
    <div class="calc">Data is stored only on this phone. ${DB.setting('lastBackup') ? 'Last backup: <b>' + fmtD(DB.setting('lastBackup').slice(0, 10)) + '</b>' : '<b>No backup yet.</b>'}<br>Keep the backup file in Google Drive or send it to yourself. Use the same file to move data to another phone or doctor.</div>
    <div class="inl" style="margin-top:10px"><button class="btn pri" data-act="backup">⬇ Back up now</button><button class="btn sec" data-act="restore">⬆ Restore / merge</button></div>
+   <div class="f"><label>Remind me to back up every</label><div class="chipset">${[1, 3, 7].map(d => `<button class="chip ${DB.setting('bkDays', 7) === d ? 'on' : ''}" data-act="bkdays" data-v="${d}">${d === 1 ? 'Day' : d + ' days'}</button>`).join('')}</div><div class="hint">Records must be kept for at least 3 years from the start of treatment (NCISM 2023). Keep backups for that long.</div></div>
    <input type="file" id="restoreFile" accept=".json,application/json" class="hidden">
+   <div class="st">Certificate register</div>
+   ${(() => { const cs = Object.values(DB.certs).filter(c => c.status === 'issued').sort((a, b) => b.no.localeCompare(a.no)); return cs.length ? `<table class="sc"><thead><tr><th>No.</th><th>Date</th><th>Patient</th><th>Type</th></tr></thead><tbody>${cs.slice(0, 50).map(c => `<tr><td><a href="#/cert/${c.id}" style="text-decoration:underline">${esc(c.no)}</a></td><td>${fmtD(c.date)}</td><td>${esc(DB.patients[c.pid]?.name || '—')}</td><td>${esc(c.type.replace(/ \(.*/, ''))}</td></tr>`).join('')}</tbody></table>` : '<div class="hint">Certificates issued from a patient’s profile appear here.</div>'; })()}
+   <div class="st">Activity log</div>
+   ${(() => { const lg = auditOf().slice(0, 20); return lg.length ? `<table class="sc"><tbody>${lg.map(a => `<tr><td style="width:36%;font-size:12.5px;color:var(--mute)">${fmtDT(a.at)}</td><td>${esc(a.action)}<br><small style="color:var(--mute)">${esc(DB.patients[a.pid]?.name || '')}${a.detail ? ' · ' + esc(a.detail) : ''}</small></td></tr>`).join('')}</tbody></table>` : '<div class="hint">No activity yet.</div>'; })()}
    <div class="st">Pathya–apathya templates</div>
    ${Object.keys(tpl).length ? Object.keys(tpl).map(n => `<div class="lrow" style="padding:10px 0"><div class="m"><b>${esc(n)}</b></div><button class="chip" data-act="deltpl" data-v="${esc(n)}">Delete</button></div>`).join('') : '<div class="hint">Save a template from the Treatment step of any visit.</div>'}
    <div class="st">About</div>
@@ -711,7 +926,7 @@ async function deriveKey(pw, salt) { const k = await crypto.subtle.importKey('ra
 async function backup() {
   const pw = await ask('Backup password', 'Protect the backup file with a password (recommended). Leave empty for no password. You will need it to restore.', 'password');
   if (pw === null) return;
-  const data = JSON.stringify({ app: 'cdaat-ehr', v: APPV, at: new Date().toISOString(), patients: Object.values(DB.patients), visits: Object.values(DB.visits), settings: DB.meta.settings || {} });
+  const data = JSON.stringify({ app: 'cdaat-ehr', v: APPV, at: new Date().toISOString(), patients: Object.values(DB.patients), visits: Object.values(DB.visits), audit: Object.values(DB.audit), certs: Object.values(DB.certs), settings: DB.meta.settings || {} });
   let out;
   if (pw && crypto.subtle) { const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12)); const key = await deriveKey(pw, salt); const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(data)); out = JSON.stringify({ app: 'cdaat-ehr', enc: true, salt: b64.enc(salt), iv: b64.enc(iv), data: b64.enc(ct) }); }
   else out = data;
@@ -729,6 +944,9 @@ async function restore(f) {
   let np = 0, nv = 0;
   for (const p of j.patients || []) { const cur = DB.patients[p.id]; if (!cur || (p.updatedAt || '') > (cur.updatedAt || '')) { await DB.put('patients', p); np++; } }
   for (const v of j.visits || []) { const cur = DB.visits[v.id]; if (!cur || (v.updatedAt || '') > (cur.updatedAt || '')) { await DB.put('visits', v); nv++; } }
+  for (const c of j.certs || []) { const cur = DB.certs[c.id]; if (!cur || (c.updatedAt || '') > (cur.updatedAt || '')) await DB.put('certs', c); }
+  for (const a of j.audit || []) if (!DB.audit[a.id]) await DB.put('audit', a);
+  await logA('Backup restored / merged', '', `${np} patients, ${nv} visits`);
   if (!DB.meta.settings && j.settings) await DB.put('meta', { ...j.settings, id: 'settings' });
   toast(`Restored: ${np} patients, ${nv} visits updated`); vSettings();
 }
@@ -799,6 +1017,7 @@ document.addEventListener('click', async e => {
     if (chip.dataset.multi) { let a = getP(o, k); if (!Array.isArray(a)) a = []; a = a.includes(v) ? a.filter(x => x !== v) : [...a, v]; setP(o, k, a); chip.classList.toggle('on'); }
     else { const cur = getP(o, k); const nv = cur === v ? '' : v; setP(o, k, nv); $$(`[data-chip][data-k="${k}"]`).forEach(c => c.classList.toggle('on', c.dataset.v === nv)); }
     if (k === 'sex') { autosave(); const y = window.scrollY; rerouteKeep(); window.scrollTo(0, y); return; }
+    if (chip.dataset.c === 'c') { autosave(); const y = window.scrollY; vCert(S.c.id); window.scrollTo(0, y); return; }
     if (k === 'nextIn' && getP(o, k)) { const d = new Date(); const x = getP(o, k); if (x.includes('day')) d.setDate(d.getDate() + parseInt(x)); else d.setMonth(d.getMonth() + parseInt(x)); setP(o, 'next', d.toISOString().slice(0, 10)); const n = $('[data-k="next"]'); if (n) n.value = o.next; }
     if (k.startsWith('pk.') && k.endsWith('.resp')) { autosave(); const y = window.scrollY; vVisit(S.v.id, 'tx'); window.scrollTo(0, y); return; }
     if (k.startsWith('cdaat.concl') && $('.gauges')) { autosave(); const y = window.scrollY; vVisit(S.v.id, 'cdaat'); window.scrollTo(0, y); return; }
@@ -828,13 +1047,22 @@ document.addEventListener('click', async e => {
   else if (act === 'usetpl') { const t = DB.setting('paTemplates', {})[v]; if (t) { S.v.pa = { ...t }; autosave(); const y = window.scrollY; rerouteKeep(); window.scrollTo(0, y); toast('Template applied'); } }
   else if (act === 'savetpl') { if (!S.v.pa?.pathya && !S.v.pa?.apathya) return toast('Write pathya / apathya first'); const n = await ask('Template name', 'e.g. Amavata, Amlapitta'); if (n) { const t = DB.setting('paTemplates', {}); t[n] = { pathya: S.v.pa.pathya || '', apathya: S.v.pa.apathya || '' }; await DB.saveSetting('paTemplates', t); toast('Template saved'); const y = window.scrollY; rerouteKeep(); window.scrollTo(0, y); } }
   else if (act === 'deltpl') { const t = DB.setting('paTemplates', {}); delete t[v]; await DB.saveSetting('paTemplates', t); vSettings(); }
+  else if (act === 'pcard') patientCard(DB.visits[v]);
+  else if (act === 'casefile') { const named = await confirmBox('Show patient identity?', 'Choose “Hide” for case presentations or publications – initials only, no phone, address, ID or OPD no. Use only with the patient’s consent and never for publicity or cure claims (NCISM 27(ख)).', 'Show name', 'Hide'); if (named !== null) caseFile(v, named); }
+  else if (act === 'pexport') exportPatient(v);
+  else if (act === 'consentform') consentForm(S.p);
+  else if (act === 'consentformp') consentForm(DB.patients[v]);
+  else if (act === 'newcert') newCert(v);
+  else if (act === 'certprint') printCert(v);
+  else if (act === 'certissue') { const c = DB.certs[v]; if (!c.idMark) { toast('Add the patient identification mark'); return; } if (c.status !== 'issued') { c.status = 'issued'; c.issuedAt = new Date().toISOString(); await DB.put('certs', c); S.amendFor = c.id; await logA('Certificate issued', c.pid, `${c.no} · ${c.type}`); toast('Certificate issued and added to register'); } go(`#/p/${c.pid}/certs`); }
+  else if (act === 'bkdays') { await DB.saveSetting('bkDays', +v); vSettings(); }
   else if (act === 'setpin') setPin();
   else if (act === 'nopin') { if (await confirmBox('Remove PIN?', 'The app will open without a PIN.', 'Remove')) { localStorage.removeItem('cdaat_pin'); vSettings(); } }
   else if (act === 'backup') backup();
   else if (act === 'restore') $('#restoreFile').click();
   else if (act === 'csv') exportCSV();
-  else if (act === 'delvisit') { if (await confirmBox('Delete this visit?', 'This cannot be undone. Take a backup first if unsure.', 'Delete')) { const pid = DB.visits[v].pid; await DB.del('visits', v); toast('Visit deleted'); go(`#/p/${pid}/visits`); } }
-  else if (act === 'delpatient') { if (await confirmBox('Delete patient and all visits?', 'This cannot be undone. Take a backup first if unsure.', 'Delete')) { for (const x of visitsOf(v)) await DB.del('visits', x.id); await DB.del('patients', v); toast('Patient deleted'); go('#/patients'); } }
+  else if (act === 'delvisit') { const reason = await ask('Reason for deleting this visit', 'Required – it is kept in the record history. Records should normally be kept for 3 years (NCISM 2023).'); if (reason && reason.trim()) { const x = DB.visits[v]; await logA('Visit deleted', x.pid, `Visit of ${fmtD(x.date)} · reason: ${reason}`); await DB.del('visits', v); toast('Visit deleted'); go(`#/p/${x.pid}/visits`); } else if (reason !== null) toast('A reason is required'); }
+  else if (act === 'delpatient') { const fd = DB.patients[v].firstDate || today(); const young = (Date.now() - new Date(fd)) < 3 * 365 * 864e5; const reason = await ask('Reason for deleting this patient', (young ? 'Warning: this record is less than 3 years old – NCISM 2023 requires keeping records for 3 years. ' : '') + 'The reason is kept in the activity log. This cannot be undone.'); if (!reason || !reason.trim()) { if (reason !== null) toast('A reason is required'); return; } if (await confirmBox('Delete patient and all visits?', 'Take a backup first if unsure.', 'Delete')) { await logA('Patient deleted', v, `OPD ${DB.patients[v].opd} · reason: ${reason}`); for (const x of visitsOf(v)) await DB.del('visits', x.id); await DB.del('patients', v); toast('Patient deleted'); go('#/patients'); } }
   else if (act === 'wipe') { if (await confirmBox('Erase ALL data?', 'Every patient and visit on this phone will be deleted. Take a backup first.', 'Erase everything')) { for (const id of Object.keys(DB.visits)) await DB.del('visits', id); for (const id of Object.keys(DB.patients)) await DB.del('patients', id); toast('All data erased'); vSettings(); } }
 });
 document.addEventListener('input', e => {
@@ -851,6 +1079,7 @@ document.addEventListener('input', e => {
   autosave();
 });
 document.addEventListener('change', e => { if (e.target.tagName === 'SELECT' && e.target.dataset.k) e.target.dispatchEvent(new Event('input', { bubbles: true })); });
+document.addEventListener('change', e => { if (e.target.dataset.k === 'age' && e.target.dataset.c === 'p' && location.hash.includes('/reg')) { const y = window.scrollY; setTimeout(() => { rerouteKeep(); window.scrollTo(0, y); }, 400); } });
 function dupCheck() {
   const p = S.p, el = $('#dupWarn'); if (!el) return;
   const d = Object.values(DB.patients).find(x => x.id !== p.id && x.name && p.name && x.name.trim().toLowerCase() === p.name.trim().toLowerCase() && (!p.phone || !x.phone || x.phone === p.phone));
@@ -864,12 +1093,14 @@ function route() {
   const h = location.hash || '#/today';
   const [, a, b, c] = h.split('/');
   if (a !== 'visit') S.tab = 'A';
+  if (a !== 'cert') S.c = null;
   if (a === 'today' || !a) vToday();
   else if (a === 'patients') vPatients();
   else if (a === 'new') newPatient();
   else if (a === 'p') vProfile(b, c);
   else if (a === 'visit') vVisit(b, c);
   else if (a === 'vd') vVisitDetail(b);
+  else if (a === 'cert') vCert(b);
   else if (a === 'insights') vInsights();
   else if (a === 'settings') vSettings();
   else vToday();

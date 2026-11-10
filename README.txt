@@ -1,4 +1,4 @@
-VAIDYA.OS  –  version 1.0
+VAIDYA.OS  –  version 1.1
 The digital operating system for Ayurvedic healthcare
 (Offline health record for Ayurvedic OPD, with the CDAAT dosha & ama assessment built in)
 =================================================
@@ -41,6 +41,24 @@ PRIVACY
    anywhere; nothing leaves the phone unless you share a PDF, a WhatsApp message
    or a backup file yourself.
 
-UPDATING THE APP LATER
-   Upload the new files to the same Netlify site / GitHub repository.
-   Data on the phones is not affected.
+UPDATING THE APP (e.g. from 1.0 to 1.1)
+   1. On each phone: Settings → Back up now (precaution).
+   2. GitHub: open your repository → Add file → Upload files →
+      drag ALL files from this folder → Commit changes.
+   3. Wait 1–2 minutes. On the phone, close the app fully and open it again
+      (once or twice). Settings → About shows the new version number.
+   Patient data on the phones is kept – nothing needs to be re-entered.
+
+WHAT'S NEW IN 1.1
+   • Registration no., qualification and council on every printout
+   • ID proof (last 4 digits), ABHA, guardian for patients under 18
+   • Printable bilingual consent form + data notice; consent details recorded
+   • Complete patient case file (PDF) – with option to hide identity
+   • Patient follow-up card (English + Gujarati) for the patient's file
+   • Medicine timing as Morning / Afternoon / Evening / Night;
+     ingredients and use-before date for market medicines
+   • Certificate register – medical, fitness and treatment certificates
+   • Record history (audit trail): saves, amendments, deletions with reason
+   • Verification code on every PDF – changes if the record is edited
+   • Backup reminder every 1, 3 or 7 days; 3-year retention reminders
+   • Single-patient data file
